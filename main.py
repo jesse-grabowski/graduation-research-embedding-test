@@ -1,4 +1,4 @@
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional
 import time
 
 import torch
@@ -6,7 +6,11 @@ from tqdm.auto import tqdm
 from datasets import load_dataset, Dataset
 from sentence_transformers import SentenceTransformer
 
-def fetch_dataset(year):
+
+# -------------------------
+# Dataset
+# -------------------------
+def fetch_dataset(year: str) -> Dataset:
     ds = load_dataset(
         "dell-research-harvard/AmericanStories",
         "subset_years",
@@ -16,7 +20,11 @@ def fetch_dataset(year):
     )
     return ds[year]
 
-def get_best_device():
+
+# -------------------------
+# Device selection
+# -------------------------
+def get_best_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -24,79 +32,143 @@ def get_best_device():
     else:
         return torch.device("cpu")
 
+
+# -------------------------
+# Chunk generator (STANDARD)
+# -------------------------
+def iter_token_chunks(
+    texts: Iterable[str],
+    tokenizer,
+    chunk_size: int = 128,
+    overlap: int = 16,
+):
+    """
+    Yield token windows (lists of token ids).
+    Standard streaming chunker used in production pipelines.
+    """
+    step = chunk_size - overlap
+    for text in texts:
+        if not isinstance(text, str) or not text.strip() or len(text) < chunk_size:
+            continue
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        for i in range(0, len(ids), step):
+            window = ids[i : i + chunk_size]
+            if not window:
+                break
+            yield window
+            if i + chunk_size >= len(ids):
+                break
+
+
+# -------------------------
+# Embedding pipeline
+# -------------------------
 def embed_dataset(
     ds: Dataset,
     text_field: str,
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    batch_size: int = 64,
-    max_length: int = 256,
+    model_name: str,
     device: Optional[torch.device] = None,
-) -> Tuple[List[List[float]], dict]:
+    chunk_size: int = 128,
+    overlap: int = 16,
+    embed_batch_size: int = 64,   # tuned for Qwen 4B
+):
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available()
-                              else "mps" if torch.backends.mps.is_available()
-                              else "cpu")
+        device = get_best_device()
 
+    print(f"Loading model {model_name} on {device}")
     model = SentenceTransformer(model_name, device=str(device))
+
+    # IMPORTANT for Qwen: keep internal padding aligned
+    model.max_seq_length = chunk_size
 
     tokenizer = model.tokenizer
 
-    total_texts = len(ds)
     total_tokens = 0
+    total_chunks = 0
     start = time.perf_counter()
 
-    embeddings: List[List[float]] = []
+    chunk_text_batch = []
+    chunk_token_batch = 0
 
-    pbar = tqdm(range(0, total_texts, batch_size), desc="Embedding", unit="batch")
-    for i in pbar:
-        batch_texts = ds[text_field][i:i + batch_size]
+    pbar = tqdm(total=len(ds), desc="Embedding", unit="doc")
 
-        enc = tokenizer(
-            batch_texts,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_attention_mask=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        batch_tokens = int(enc["attention_mask"].sum().item())
-        total_tokens += batch_tokens
+    for row in ds:
+        text = row[text_field]
 
-        # Encode (SentenceTransformers handles batching; we pass max_length for truncation)
-        batch_emb = model.encode(
-            batch_texts,
-            batch_size=len(batch_texts),
+        for window in iter_token_chunks(
+            [text],
+            tokenizer,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        ):
+            chunk_text_batch.append(
+                tokenizer.decode(
+                    window,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
+            )
+            chunk_token_batch += len(window)
+
+            if len(chunk_text_batch) == embed_batch_size:
+                # ---- embed fixed-size batch ----
+                model.encode(
+                    chunk_text_batch,
+                    batch_size=embed_batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=False,
+                    show_progress_bar=False,
+                )
+
+                total_tokens += chunk_token_batch
+                total_chunks += len(chunk_text_batch)
+
+                chunk_text_batch.clear()
+                chunk_token_batch = 0
+
+                elapsed = time.perf_counter() - start
+                toks_per_s = total_tokens / elapsed if elapsed > 0 else 0.0
+                pbar.set_postfix(
+                    toks_s=f"{toks_per_s:,.0f}",
+                    total_toks=f"{total_tokens:,}",
+                    chunks=f"{total_chunks:,}",
+                )
+
+        pbar.update(1)
+
+    # ---- final flush ----
+    if chunk_text_batch:
+        model.encode(
+            chunk_text_batch,
+            batch_size=len(chunk_text_batch),
             convert_to_numpy=True,
             normalize_embeddings=False,
             show_progress_bar=False,
-            device=str(device),
         )
-        # save memory for now and don't keep embeddings
-        # embeddings.extend(batch_emb.tolist())
-
-        elapsed = time.perf_counter() - start
-        toks_per_s = total_tokens / elapsed if elapsed > 0 else 0.0
-        pbar.set_postfix(
-            toks_s=f"{toks_per_s:,.0f}",
-            toks=batch_tokens,
-            total_toks=f"{total_tokens:,}",
-        )
+        total_tokens += chunk_token_batch
+        total_chunks += len(chunk_text_batch)
 
     elapsed = time.perf_counter() - start
+    pbar.close()
+
     stats = {
-        "total_texts": total_texts,
+        "documents": len(ds),
+        "chunks": total_chunks,
         "total_tokens": total_tokens,
         "elapsed_s": elapsed,
-        "toks_per_s": (total_tokens / elapsed) if elapsed > 0 else 0.0,
-        "model_name": model_name,
-        "batch_size": batch_size,
-        "max_length": max_length,
+        "tokens_per_second": total_tokens / elapsed if elapsed > 0 else 0.0,
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "embed_batch_size": embed_batch_size,
+        "model": model_name,
         "device": str(device),
-        "text_field": text_field,
     }
-    return embeddings, stats
+    return stats
 
+
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     device = get_best_device()
     print("Using device:", device)
@@ -105,16 +177,16 @@ if __name__ == "__main__":
     print("Rows:", len(ds))
     print("Columns:", ds.column_names)
 
-    text_field = "article"
-
-    embeddings, stats = embed_dataset(
+    stats = embed_dataset(
         ds,
-        text_field=text_field,
-        device=device,
-        batch_size=1,
-        max_length=256,
+        text_field="article",
         model_name="Qwen/Qwen3-Embedding-4B",
+        device=device,
+        chunk_size=128,
+        overlap=16,
+        embed_batch_size=1,
     )
 
-    print("Done.")
-    print(stats)
+    print("\nDone.")
+    for k, v in stats.items():
+        print(f"{k}: {v}")
