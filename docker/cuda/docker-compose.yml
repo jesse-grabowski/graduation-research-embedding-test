@@ -14,8 +14,11 @@ services:
       TRANSFORMERS_CACHE: /hf_cache/transformers
       TMPDIR: /hf_cache/tmp
       DEVICE: cuda
-    device_requests:
-      - driver: nvidia
-        count: -1
-        capabilities: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     command: ["python3", "main.py"]
