@@ -1,0 +1,17 @@
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: docker/cpu/Dockerfile
+    container_name: embedding-cpu
+    working_dir: /app
+    volumes:
+      - ../../:/app
+      - ../../hf_cache:/hf_cache
+    environment:
+      HF_HOME: /hf_cache
+      HF_DATASETS_CACHE: /hf_cache/datasets
+      TRANSFORMERS_CACHE: /hf_cache/transformers
+      TMPDIR: /hf_cache/tmp
+      DEVICE: cpu
+    command: ["python", "main.py"]

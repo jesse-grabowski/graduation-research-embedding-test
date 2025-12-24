@@ -1,0 +1,1 @@
+docker compose -f docker/cuda/docker-compose.yml up --build

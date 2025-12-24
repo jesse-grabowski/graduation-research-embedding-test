@@ -1,0 +1,21 @@
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: docker/cuda/Dockerfile
+    container_name: embedding-cuda
+    working_dir: /app
+    volumes:
+      - ../../:/app
+      - ../../hf_cache:/hf_cache
+    environment:
+      HF_HOME: /hf_cache
+      HF_DATASETS_CACHE: /hf_cache/datasets
+      TRANSFORMERS_CACHE: /hf_cache/transformers
+      TMPDIR: /hf_cache/tmp
+      DEVICE: cuda
+    device_requests:
+      - driver: nvidia
+        count: -1
+        capabilities: ["gpu"]
+    command: ["python3", "main.py"]
