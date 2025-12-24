@@ -6,7 +6,7 @@ IMAGE_NAME="embedding-cuda"
 CONTAINER_NAME="embedding-cuda"
 
 # Resolve project root (two levels up from this script)
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HF_CACHE="${PROJECT_ROOT}/hf_cache"
 
 DOCKERFILE="${PROJECT_ROOT}/docker/cuda/Dockerfile"
